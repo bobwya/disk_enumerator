@@ -4,15 +4,15 @@ script_path=$(readlink -f $0)
 script_folder=$( dirname "${script_path}" )
 script_name=$( basename "${script_path}" )
 
-verbose=1
-volour=0
+verbose=2
+colour=1
 unknown=0
 
 display_usage ()
 {
 	printf "Usage: %s [OPTIONS]" "${script_name}" >&2
 	if [ $# -gt 0 ]; then
-		printf " ... unknown OPTION \"%s\"\n" "$1" >&2
+		printf "\n ... unknown OPTION \"%s\"\n" "$1" >&2
 	else
 		printf "\n"
 	fi
@@ -22,11 +22,11 @@ display_usage ()
 			${short_field_width} "-c[=SETTING],"																	\
 				${long_field_width}  "--colour[=SETTING]" ""														\
 			${short_field_width} ""																					\
-				${long_field_width} ""				"enable colourisation"											\
+				${long_field_width} ""				"disable colourisation"											\
 			${short_field_width} ""																					\
-				${long_field_width} ""				"SETTING='yes' or SETTING='y' enables colourisation"			\
+				${long_field_width} ""				"SETTING='yes' or SETTING='y' enables colourisation (default)"	\
 			${short_field_width} ""																					\
-				${long_field_width} ""				"SETTING='no' or SETTING='n' disables colourisation (default)"	\
+				${long_field_width} ""				"SETTING='no' or SETTING='n' disables colourisation"			\
 			${short_field_width} "-v,"																				\
 				${long_field_width} "--verbose"	"output additional information"										\
 			${short_field_width} "-q,"																				\
@@ -72,7 +72,7 @@ for variable in "$@"; do
 		verbose=$((verbose-1))
 		;;
 	--color|--colour)
-		colour=1
+		colour=0
 		;;
 	-c=*|--color=*|--colour=*)
 		if [[ "${variable}" =~ [Nn][Oo]* ]]; then
@@ -90,7 +90,7 @@ for variable in "$@"; do
 			elif [[ "${variable:${i}:1}" == "q" ]]; then
 				verbose=$((verbose-1))
 			elif [[ "${variable:${i}:1}" == "c" ]]; then
-				colour=1
+				colour=0
 			else
 				unknown=1
 			fi
@@ -160,19 +160,53 @@ function enumerate_disk_devices(array_disk_devices,
 
 
 function enumerate_pci_devices(array_pci_devices,
-		command_lspci, device, save_FS)
+		capability_open, command_lspci, lspci_line, pci_address, pcie_capability, save_FS)
 {
 	save_FS=FS
 	FS=" "
 	delete array_pci_devices
-	command_lspci="lspci"
-	while ((command_lspci | getline device) > 0) {
-		match(device, "[[:alnum:]]{2}\:[[:alnum:]]{2}\.[[:alnum:]]")
-		pci_address=substr(device, RSTART, RLENGTH)
-		match(device, "[\:\.[:alnum:]]+[[:blank:]]+")
-		device=substr(device, RSTART+RLENGTH)
-		array_pci_devices[++array_pci_devices[0],"address"]="0000:" pci_address
-		array_pci_devices[array_pci_devices[0],"description"]=device
+	array_pci_devices[0]=1
+	command_lspci="lspci -vvv"
+	while ((command_lspci | getline lspci_line) > 0) {
+		if (lspci_line == "") {
+			++array_pci_devices[0]
+			capability_open=0
+			continue
+		}
+		match(lspci_line, regexp_pci_device_node)
+		if (RSTART > 0) {
+			pci_address=substr(lspci_line, RSTART, RLENGTH)
+			match(lspci_line, "[\:\.[:alnum:]]+[[:blank:]]+")
+			device=substr(lspci_line, RSTART+RLENGTH)
+			array_pci_devices[array_pci_devices[0],"address"]="0000:" pci_address
+			array_pci_devices[array_pci_devices[0],"description"]=gensub(regexp_pci_device_node, "", "g", lspci_line)
+			array_pci_devices[array_pci_devices[0],"description"]=gensub(regexp_leading_trailing_whitespace, "", "g", array_pci_devices[array_pci_devices[0],"description"])
+			continue
+		}
+		
+		match(lspci_line, regexp_pcie_capability)
+		if (RSTART > 0) {
+			array_pci_devices[array_pci_devices[0],"pcie capability"]=gensub(regexp_pcie_capability, "\\1", "g", lspci_line)
+			capability_open=1
+			continue
+		}
+
+		if (! capability_open)
+			continue
+			
+		match(lspci_line, regexp_pcie_link_capability)
+		if (RSTART > 0) {
+			array_pci_devices[array_pci_devices[0],"pcie port"]=gensub(regexp_pcie_link_capability, "\\1", "g", lspci_line)
+			array_pci_devices[array_pci_devices[0],"speed theoretical"]=gensub(regexp_pcie_link_capability, "\\2", "g", lspci_line)
+			array_pci_devices[array_pci_devices[0],"width theoretical"]=gensub(regexp_pcie_link_capability, "\\3", "g", lspci_line)
+			continue
+		}
+		match(lspci_line, regexp_pcie_link_status)
+		if (RSTART > 0) {
+			array_pci_devices[array_pci_devices[0],"speed status"]=gensub(regexp_pcie_link_status, "\\1", "g", lspci_line)
+			array_pci_devices[array_pci_devices[0],"width status"]=gensub(regexp_pcie_link_status, "\\2", "g", lspci_line)
+			continue
+		}
 	}
 	close (command_lspci)
 	FS=save_FS
@@ -199,6 +233,7 @@ function detect_pci_controller_path(disk_device, array_disk_attributes,
 			else if (array_subpaths[i_path] ~ regexp_scsi_channel) {
 				array_disk_attributes["channel"]=gensub(regexp_scsi_channel, "\\1", "g", array_subpaths[i_path])
 				array_disk_attributes["lun"]=gensub(regexp_scsi_channel, "\\2", "g", array_subpaths[i_path])
+				array_disk_attributes["port"]=gensub(regexp_scsi_channel, "\\3", "g", array_subpaths[i_path])
 			}
 		}
 	}
@@ -278,8 +313,14 @@ function display_drive_info(array_disk_devices, i_disk_device,
 					ttygreen, array_disk_devices[i_disk_device,"capacity"], ttyreset)	
 	if ((verbose > 0) && (array_disk_devices[i_disk_device,"serial number"] != ""))
 		printf(" (%s%s%s)", ttyred, array_disk_devices[i_disk_device,"serial number"], ttyreset)
-	if ((verbose >= 3) && (array_disk_devices[i_disk_device,"channel"] != "") && (array_disk_devices[i_disk_device,"lun"] != ""))
-		printf(" (%sChannel: %s; LUN: %s%s)", ttyblue, array_disk_devices[i_disk_device,"channel"], array_disk_devices[i_disk_device,"lun"], ttyreset)
+	if ((verbose >= 3) 												\
+		&& (array_disk_devices[i_disk_device,"channel"] != "")		\
+		&& (array_disk_devices[i_disk_device,"lun"] != "")			\
+		&& (array_disk_devices[i_disk_device,"port"] != ""))
+		printf(" (%sChannel: %s; LUN: %s; Port %s%s)",
+				ttyblue, array_disk_devices[i_disk_device,"channel"],
+				array_disk_devices[i_disk_device,"lun"],
+				array_disk_devices[i_disk_device,"port"], ttyreset)
 	print
 	if (verbose > 0) {
 		indent+=length(array_disk_devices[i_disk_device,"path"] " : ")
@@ -302,7 +343,7 @@ function display_drive_info(array_disk_devices, i_disk_device,
 
 
 function display_pci_device_info(array_pci_devices, i_pci_device,
-		controller_description, controller_type)
+		controller_description, controller_type, pcie_information)
 {
 	controller_type=gensub("\:.+$", "", "g", array_pci_devices[i_pci_device, "description"])
 	controller_description=gensub("(^[^\:]+\:|^[[:blank:]]+|[[:blank:]]+$)", "", "g", array_pci_devices[i_pci_device, "description"])
@@ -313,13 +354,42 @@ function display_pci_device_info(array_pci_devices, i_pci_device,
 		printf("  (%s%s%s)",
 				ttyred, array_pci_devices[i_pci_device, "address"], ttyreset)
 	print
+	if (verbose >= 2) {
+		if ((array_pci_devices[i_pci_device,"pcie port"] != "") && (array_pci_devices[i_pci_device,"pcie capability"] != "")) {
+			printf("%*s%sPCIe Version %s%s %sport %s%s:  ",
+					length(controller_type)+3, "",
+					ttycyan, array_pci_devices[i_pci_device,"pcie capability"], ttyreset, 
+					ttymagenta, array_pci_devices[i_pci_device,"pcie port"], ttyreset)
+			pcie_information=1
+		}
+		if ((array_pci_devices[i_pci_device,"speed status"] != "") && (array_pci_devices[i_pci_device,"width status"] != "")) {
+			printf("%sspeed%s: %s%s%s ; %slanes%s: %sx%s%s",
+					ttymagenta, ttyreset, ttycyan, array_pci_devices[i_pci_device,"speed status"], ttyreset,
+					ttymagenta, ttyreset, ttycyan, array_pci_devices[i_pci_device,"width status"], ttyreset)
+			pcie_information=1
+		}
+		if ((array_pci_devices[i_pci_device,"speed theoretical"] != "") && (array_pci_devices[i_pci_device,"width theoretical"] != "")) {
+			printf("   %s[ speed%s: %s%s%s ; %slanes%s: %sx%s%s %s(maximum) ]%s",
+					ttymagenta, ttyreset,  ttycyan, array_pci_devices[i_pci_device,"speed theoretical"], ttyreset,
+					ttymagenta, ttyreset,  ttycyan, array_pci_devices[i_pci_device,"width theoretical"], ttyreset,
+					ttymagenta, ttyreset)
+			pcie_information=1
+		}
+		if (pcie_information)
+			print
+	}
 }
 
 
 BEGIN{
 	initialise_tty_colour_codes(colour)
+	regexp_leading_trailing_whitespace="(^[[:blank:]]+|[[:blank:]]+$)"
+	regexp_pci_device_node="^([[:alnum:]]{2}\:[[:alnum:]]{2}\.[[:alnum:]])"
 	regexp_pci_address="[[:digit:]]{4}\:[[:digit:]]{2}\:[[:alnum:]]{2}\.[[:alnum:]]"
 	regexp_scsi_channel="([[:digit:]]+)\:([[:digit:]]+)\:([[:alnum:]]+)\:([[:alnum:]]+)"
+	regexp_pcie_capability="^[[:blank:]]+Capabilities\:[[:blank:]]+[\[][[:alnum:]]{2}[\]][[:blank:]]Express[[:blank:]]+[\(]v([[:digit:]]+)[\)].+Endpoint.+$"
+	regexp_pcie_link_capability="^[[:blank:]]+LnkCap\:[[:blank:]]+Port[[:blank:]]+(\#[[:digit:]]+)\,[[:blank:]]+Speed[[:blank:]]+([\.\/[:alnum:]]+)\,[[:blank:]]+Width[[:blank:]]+x([[:digit:]]+)\,.+$"
+	regexp_pcie_link_status="^[[:blank:]]+LnkSta\:[[:blank:]]+Speed[[:blank:]]+([\.\/[:alnum:]]+)\,[[:blank:]]+Width[[:blank:]]+x([[:digit:]]+)\,.+$"
 }
 
 {
