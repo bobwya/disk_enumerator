@@ -108,6 +108,35 @@ done
 	
 echo "" | gawk -vverbose=${verbose} -vcolour=${colour} '
 
+# Uppercase first letter of each word. Uses heuristics to guess words that are not acronyms!
+function convert_to_title_case(text_string,
+		array_words, i, word_count)
+{
+	word_count=split(text_string, array_words, " ")
+	text_string=""
+	for (i=1; i<=word_count; ++i) {
+		if ((array_words[i] ~ "^[[:alpha:]].+") && (array_words[i] ~ "(A|E|I|O|U|a|e|i|o|u)") && (length(array_words[i]) > 2))
+			text_string=text_string " " toupper(substr(array_words[i],1,1)) tolower(substr(array_words[i],2))
+		else
+			text_string=text_string " " toupper(array_words[i])
+	}
+	text_string=substr(text_string, 2)
+	return (text_string)
+}
+
+# Remove disk size information from model names
+function strip_size_information(text_string,
+                array_words, i, word_count)
+{
+        word_count=split(text_string, array_words, " ")
+        text_string=""
+        for (i=1; i<=word_count; ++i) {
+                if (array_words[i] !~ "^[\,\.[:digit:]]+(M|G|T)(b|B)$")
+                        text_string=text_string " " array_words[i]
+        }
+        text_string=substr(text_string, 2)
+        return (text_string)
+}
 
 function initialise_tty_colour_codes(use_colour,
 		command_ttyblue, command_ttycyan, command_ttygreen, command_ttymagenta, command_ttyred, command_ttyreset, command_ttywhite, command_ttyyellow)
@@ -275,7 +304,6 @@ function enumerate_disk_device_smart_attributes(disk_device, array_disk_attribut
 	if (samsung_ssd) {
 		array_disk_attributes["form factor"]=(array_disk_attributes["form factor"] == "") ? "2.5 inches / M2" : array_disk_attributes["form factor"]
 		array_disk_attributes["model family"]=gensub("Series$", "", "g", array_disk_attributes["device model"])
-		array_disk_attributes["model family"]=gensub("SAMSUNG", "Samsung", "g", array_disk_attributes["model family"])
 		array_disk_attributes["model family"]=gensub("(^[[:blank:]]+|[[:blank:]]+$|SSD|ssd)", "", "g", array_disk_attributes["model family"])
 		array_disk_attributes["model family"]=array_disk_attributes["model family"] " SSD"
 		array_disk_attributes["model family"]=gensub("[[:blank:]]{2,}", " ", "g", array_disk_attributes["model family"])
@@ -297,7 +325,14 @@ function enumerate_disk_device_smart_attributes(disk_device, array_disk_attribut
 		array_disk_attributes["model family"]=gensub(array_disk_attributes["device model"], "", "g", array_disk_attributes["model family"])
 		array_disk_attributes["model family"]=gensub("(^[[:blank:]]+|[[:blank:]]+$)", "", "g", array_disk_attributes["model family"])
 	}
-
+	if (array_disk_attributes["model family"] == "")
+		array_disk_attributes["model family"]=array_disk_attributes["device model"]
+	if (array_disk_attributes["device model"] ~ "^[ [:alpha:]]+$") {
+		array_disk_attributes["device model"]=convert_to_title_case(array_disk_attributes["device model"])
+		array_disk_attributes["device model"]=strip_size_information(array_disk_attributes["device model"])
+	}
+	array_disk_attributes["model family"]=convert_to_title_case(array_disk_attributes["model family"])
+	array_disk_attributes["model family"]=strip_size_information(array_disk_attributes["model family"])
 	FS=save_FS
 }
 
