@@ -7,6 +7,7 @@ script_name=$( basename "${script_path}" )
 verbose=2
 colour=1
 unknown=0
+partitions_enabled=0
 
 display_usage ()
 {
@@ -18,7 +19,7 @@ display_usage ()
 	fi
 	short_field_width=-5
 	long_field_width=-20
-	printf "  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n"		\
+	printf "  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n  %*s%*s%s\n" \
 			${short_field_width} "-c[=SETTING],"																	\
 				${long_field_width}  "--colour[=SETTING]" ""														\
 			${short_field_width} ""																					\
@@ -31,6 +32,8 @@ display_usage ()
 				${long_field_width} "--verbose"	"output additional information"										\
 			${short_field_width} "-q,"																				\
 				${long_field_width} "--quiet"		"output minimal information"									\
+			${short_field_width} "-p,"																				\
+				${long_field_width} "--partitions"	"output partition table information for each drive"				\
 			${short_field_width} "-h,"																				\
 				${long_field_width} "--help"		"this help message"												\
 			>&2
@@ -46,18 +49,21 @@ if ! which gawk &>/dev/null ; then
 	exit 3
 fi
 if ! which smartctl &>/dev/null ; then
-	printf "%s: this script requires smartctl utility (part of smartmontools package)!\n" "${script_name}" >&2
+	printf "%s: this script requires the smartctl utility (part of smartmontools package)!\n" "${script_name}" >&2
 	exit 3
 fi
 if ! which lspci &>/dev/null ; then
-	printf "%s: this script requires lspci utility (part of pciutils package)!\n" "${script_name}" >&2
+	printf "%s: this script requires the lspci utility (part of pciutils package)!\n" "${script_name}" >&2
 	exit 3
 fi
 if ! which udevadm &>/dev/null ; then
-	printf "%s: this script requires udevadm utility!\n" "${script_name}" >&2
+	printf "%s: this script requires the udevadm utility!\n" "${script_name}" >&2
 	exit 3
 fi
-
+if ! which parted &>/dev/null ; then
+	printf "%s: this script requires the parted utility!\n" "${script_name}" >&2
+	exit 3
+fi
 
 for variable in "$@"; do
     case "${variable}" in
@@ -70,6 +76,9 @@ for variable in "$@"; do
 		;;
 	--quiet)
 		verbose=$((verbose-1))
+		;;
+	-p*|--partition*)
+		partitions_enabled=1
 		;;
 	--color|--colour)
 		colour=0
@@ -106,7 +115,7 @@ for variable in "$@"; do
 	fi
 done
 	
-echo "" | gawk -vverbose=${verbose} -vcolour=${colour} '
+echo "" | gawk -vpartitions_enabled=${partitions_enabled} -vverbose=${verbose} -vcolour=${colour} '
 
 # Uppercase first letter of each word. Uses heuristics to guess words that are not acronyms!
 function convert_to_title_case(text_string,
@@ -178,7 +187,7 @@ function enumerate_disk_devices(array_disk_devices,
 	save_FS=FS
 	FS=" "
 	delete array_disk_devices
-	command_smartctl="smartctl --scan"
+	command_smartctl="smartctl --scan 2>/dev/null"
 	while ((command_smartctl | getline) > 0) {
 		array_disk_devices[++array_disk_devices[0],"path"]=$1
 	}
@@ -249,7 +258,7 @@ function detect_pci_controller_path(disk_device, array_disk_attributes,
 	save_FS=FS
 	FS="="
 	delete array_disk_attributes
-	command_udevadm="udevadm info -q all -n \"" disk_device "\""
+	command_udevadm="udevadm info -q all \"" disk_device "\""
 	while ((command_udevadm | getline) > 0) {
 		if ($1 !~ /DEVPATH/)
 			continue
@@ -277,7 +286,7 @@ function enumerate_disk_device_smart_attributes(disk_device, array_disk_attribut
 	save_FS=FS
 	FS="\:[[:blank:]]+"
 	delete array_disk_attributes
-	command_smartctl="smartctl -i \"" disk_device "\""
+	command_smartctl="smartctl -i \"" disk_device "\" 2>/dev/null"
 	while ((command_smartctl | getline) > 0) {
 		if (NF == 1)
 			continue
@@ -337,12 +346,88 @@ function enumerate_disk_device_smart_attributes(disk_device, array_disk_attribut
 }
 
 
-function display_drive_info(array_disk_devices, i_disk_device,
-		indent)
+function get_filesystem_information(disk_device, partition_number, array_filesystem_attributes,
+		command_udevadm, save_FS, value)
 {
-	indent=4
+	command_udevadm=("udevadm info -x -q \"property\" \"" disk_device partition_number "" "\" 2>/dev/null")
+	save_FS=FS
+	FS="="
+	delete array_filesystem_attributes
+	while ((command_udevadm | getline) > 0) {
+		value=$2
+		gsub("(^'\''|'\''$)", "", value)
+		gsub("\\\\x20", " ", value)
+		if ($1 == "ID_FS_LABEL_ENC")
+			array_filesystem_attributes["label"]=value
+		else if ($1 == "ID_FS_UUID")
+			array_filesystem_attributes["uuid"]=value
+		else if ($1 == "ID_FS_TYPE") {
+			sub("^ntfs\-3g$", "ntfs", value)
+			array_filesystem_attributes["type"]=toupper(value)
+			sub("^EXFAT$", "exFAT", array_filesystem_attributes["type"])
+			sub("^EXT", "ext", array_filesystem_attributes["type"])
+		}
+	}
+	close (command_udevadm)
+	FS=save_FS
+}
+
+
+function enumerate_partition_information(disk_device, array_partition_attributes,
+		array_parted_data, command_parted, parted_data, partition_flags, partition_number)
+{
+	delete array_partition_attributes
+	array_partition_attributes[0]=0
+	array_partition_attributes["partition table"]=""
+	command_parted="parted -m \"" disk_device "\" unit B -s print 2>/dev/null"
+	while ((command_parted | getline parted_data) > 0) {
+		if (split(parted_data, array_parted_data, ":") < 6)
+			continue
+
+		if ((array_parted_data[1] == disk_device) && (array_partition_attributes["partition table"] == "")) {
+			if (array_parted_data[6] == "unknown")
+				break
+			
+			array_partition_attributes["partition table"]=toupper(array_parted_data[6])
+		}
+		else if (array_parted_data[1] ~ /[[:digit:]]+/) {
+			partition_number=array_parted_data[1]
+			array_partition_attributes[++array_partition_attributes[0], "number"]=partition_number
+			array_partition_attributes[array_partition_attributes[0], "start"]=array_parted_data[2]
+			array_partition_attributes[array_partition_attributes[0], "end"]=array_parted_data[3]
+			array_partition_attributes[array_partition_attributes[0], "size"]=convert_size_to_readable_si(array_parted_data[4])
+			array_partition_attributes[array_partition_attributes[0], "FS-type"]=array_parted_data[5]
+			array_partition_attributes[array_partition_attributes[0], "partition-type"]=array_parted_data[6]
+			partition_flags=gensub(";$", "", "g", array_parted_data[7])
+			array_partition_attributes[array_partition_attributes[0], "flags"]=(partition_flags== "") ? "" : (" (" partition_flags ")")
+			get_filesystem_information(disk_device, partition_number, array_filesystem_attributes)
+			array_partition_attributes[array_partition_attributes[0], "FS-type"]=array_filesystem_attributes["type"]
+			array_partition_attributes[array_partition_attributes[0], "FS-label"]=array_filesystem_attributes["label"]
+			array_partition_attributes[array_partition_attributes[0], "FS-UUID"]=array_filesystem_attributes["uuid"]
+		}
+	}
+	close (command_parted)
+}
+
+
+function convert_size_to_readable_si(size,
+	array_si_sizes, base_size, entry, printable_si_size)
+{
+	split("B,KiB,MiB,GiB,TiB,PiB,EiB,ZiB,YiB", array_si_sizes, ",")
+	base_size=1024
+	entry=1
+	for (base_size=1024; base_size<size+0; base_size*=1024)
+		++entry
+	
+	printable_si_size=sprintf("%.2f %s", size/(base_size/1024.0), array_si_sizes[entry])
+	return (printable_si_size)
+}
+
+
+function display_drive_info(array_disk_devices, i_disk_device)
+{
 	printf("%*s%s%s%s : %s %s%s%s",
-					indent, "",  
+					global_indent, "",  
 					ttymagenta, array_disk_devices[i_disk_device,"path"], ttyreset,
 					array_disk_devices[i_disk_device,"model family"],
 					ttygreen, array_disk_devices[i_disk_device,"capacity"], ttyreset)	
@@ -356,24 +441,84 @@ function display_drive_info(array_disk_devices, i_disk_device,
 				ttyblue, array_disk_devices[i_disk_device,"channel"],
 				array_disk_devices[i_disk_device,"lun"],
 				array_disk_devices[i_disk_device,"port"], ttyreset)
-	print
-	if (verbose > 0) {
-		indent+=length(array_disk_devices[i_disk_device,"path"] " : ")
-		if ((verbose >= 2)  &&  (array_disk_devices[i_disk_device,"device model"] != ""))
-			printf("%*s%sdrive model%s: %s\n", indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"device model"]);
-		if (array_disk_devices[i_disk_device,"user capacity"] != "")
-			printf("%*s%scapacity%s: %s\n",
-					indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"user capacity"])
-		if ((verbose >= 3) && (array_disk_devices[i_disk_device,"firmware version"] != ""))
-			printf("%*s%sfirmware version%s: %s\n",
-					indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"firmware version"])
-		if ((verbose >= 4) && (array_disk_devices[i_disk_device,"sata version"] != ""))
-			printf("%*s%sSATA version%s: %s\n",
-					indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"sata version"])		
-		if ((verbose >= 5) && (array_disk_devices[i_disk_device,"form factor"] != ""))
-			printf("%*s%sform factor%s: %s\n",
-					indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"form factor"])
+	printf("\n")
+	if (verbose == 0)
+		return 0
+		
+	global_indent+=length(array_disk_devices[i_disk_device,"path"] " : ")
+	if ((verbose >= 2)  &&  (array_disk_devices[i_disk_device,"device model"] != ""))
+		printf("%*s%sdrive model%s: %s\n", global_indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"device model"]);
+	if (array_disk_devices[i_disk_device,"user capacity"] != "")
+		printf("%*s%scapacity%s: %s\n",
+				global_indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"user capacity"])
+	if ((verbose >= 3) && (array_disk_devices[i_disk_device,"firmware version"] != ""))
+		printf("%*s%sfirmware version%s: %s\n",
+				global_indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"firmware version"])
+	if ((verbose >= 4) && (array_disk_devices[i_disk_device,"sata version"] != ""))
+		printf("%*s%sSATA version%s: %s\n",
+				global_indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"sata version"])		
+	if ((verbose >= 5) && (array_disk_devices[i_disk_device,"form factor"] != ""))
+		printf("%*s%sform factor%s: %s\n",
+				global_indent,	"", ttyyellow, ttyreset, array_disk_devices[i_disk_device,"form factor"])
+}
+
+
+function display_partitions(display, array_partition_attributes, array_column_width,
+		array_index, display_column, icolumn, ipartition, total_columns, total_indices, width)
+{
+	total_columns=split("number size start end FS-type FS-label FS-UUID partition-type flags", array_index, " ")
+	for (ipartition=1; ipartition<=array_partition_attributes[0]; ++ipartition) {
+		for (icolumn=1; icolumn<=total_columns; ++icolumn) {
+			if (array_index[icolumn] ~ "^(number|start|end)$")
+				display_column=sprintf("%d", array_partition_attributes[ipartition, array_index[icolumn]])
+			else if (array_index[icolumn] ~ "^(size|partition\-type|flags)$")
+				display_column=array_partition_attributes[ipartition, array_index[icolumn]]
+			else if (array_index[icolumn] ~ "^FS\-.+$")
+				display_column=("\"" array_partition_attributes[ipartition, array_index[icolumn]] "\"")
+			if (! display) {
+				width=length(display_column)
+				if ((ipartition == 1) || (width > array_column_width[array_index[icolumn]]))
+					array_column_width[array_index[icolumn]]=width
+				continue
+			}
+			
+			if (array_index[icolumn] == "number")
+				printf("%*s[%s%*d%s] ", global_indent, "", ttygreen, array_column_width[array_index[icolumn]], display_column, ttyreset)
+			else if (array_index[icolumn] == "size")
+				printf("%s%*s%s", ttycyan, array_column_width[array_index[icolumn]], display_column, ttyreset)
+			else if ((array_index[icolumn] == "start") && (verbose > 4))
+				printf(" %s(%0*d", ttyblue, array_column_width[array_index[icolumn]], display_column)
+			else if ((array_index[icolumn] == "end") && (verbose > 4))
+				printf("-%0*d)%s ", array_column_width[array_index[icolumn]], display_column, ttyreset)
+			else if (array_index[icolumn] ~ "^FS\-.+$")
+				printf(" %s=%s%-*s%s", array_index[icolumn], ttygreen, array_column_width[array_index[icolumn]], display_column, ttyreset)
+			else if ((array_index[icolumn] ~ "^(partition\-type|flags)$") && (verbose > 3))
+				printf(" %-*s", array_column_width[array_index[icolumn]], display_column)
+		}
+		if (display)
+			printf("\n")
 	}
+}
+
+		
+function display_disk_partition_table_info(array_partition_attributes,
+		array_column_width)
+{
+	if (! partitions_enabled)
+		return 0
+
+	if (array_partition_attributes["partition table"] == "") {
+		printf("%*s%sno partition table%s\n", global_indent, "", ttyred, ttyreset)
+		return 0
+	}
+	
+	printf("%*s%spartition table: %s%s\n",
+			global_indent, "", ttywhite, ttygreen, toupper(array_partition_attributes["partition table"]), ttyreset)
+	if (verbose < 2)
+		return 0
+
+	display_partitions(0, array_partition_attributes, array_column_width)
+	display_partitions(1, array_partition_attributes, array_column_width)
 }
 
 
@@ -388,7 +533,7 @@ function display_pci_device_info(array_pci_devices, i_pci_device,
 	if (verbose > 0)
 		printf("  (%s%s%s)",
 				ttyred, array_pci_devices[i_pci_device, "address"], ttyreset)
-	print
+	printf("\n")
 	if (verbose >= 2) {
 		if ((array_pci_devices[i_pci_device,"pcie port"] != "") && (array_pci_devices[i_pci_device,"pcie capability"] != "")) {
 			printf("%*s%sPCIe Version %s%s %sport %s%s:  ",
@@ -411,7 +556,7 @@ function display_pci_device_info(array_pci_devices, i_pci_device,
 			pcie_information=1
 		}
 		if (pcie_information)
-			print
+			printf("\n")
 	}
 }
 
@@ -448,9 +593,13 @@ BEGIN{
 
 			if (! is_displayed_pci) {
 				is_displayed_pci=1
+				printf("\n")
 				display_pci_device_info(array_pci_devices, i_pci_device)
 			}
+			global_indent=4
 			display_drive_info(array_disk_devices, i_disk_device)
+			enumerate_partition_information(array_disk_devices[i_disk_device, "path"], array_partition_attributes)
+			display_disk_partition_table_info(array_partition_attributes)
 		}
 	}
 }
