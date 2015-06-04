@@ -9,7 +9,7 @@ Why?
 * Check what channel / port your disk devices are connected to (+ LUN if required)
 * Uses colourised output (optional) & text formatting so it's easy to differentiate each individual device and controller
 * Easily control the level of information displayed
-* Display partition table associated with each device
+* Display partitions associated with each device - in a colourised/ formatted table underneath the drive information
 
 
 
